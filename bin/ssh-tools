@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""SSH helpers for the dock's SSH module. Every subcommand prints one JSON object on stdout;
+failures print {"error": "..."} and exit 1.
+
+  ssh-tools hosts                               hosts from ~/.ssh/config and the Claude app, with reachability
+  ssh-tools keys [--host H]                     public keys in ~/.ssh, here or on H
+  ssh-tools generate --name N [--type T] [--comment C] [--host H]
+                                                new key pair without a passphrase
+  ssh-tools keygen-command --name N [--type T] [--comment C] [--host H]
+                                                argv for an interactive ssh-keygen (asks for a passphrase)
+  ssh-tools install --host H                    add public keys (stdin, one per line) to H's authorized_keys
+  ssh-tools install-command --host H            argv that does the same in a terminal, for password login
+  ssh-tools tunnels FILE                        saved tunnels with their live state
+  ssh-tools tunnel-save FILE SPEC_JSON          add or replace a tunnel (returns it, with its id)
+  ssh-tools tunnel-delete FILE ID               stop and forget a tunnel
+  ssh-tools tunnel-start FILE ID                start a tunnel as a systemd user unit
+  ssh-tools tunnel-stop ID                      stop it
+
+Only public keys are ever read, returned or copied; a private key file is never opened.
+Ported from PatchGoblin's SSH tools plugin (patchgoblin/plugins/ssh/sshtools.py), POSIX hosts only.
+Tunnels run as systemd user units (qs-launchpad-tunnel-<id>), so they outlive the dock.
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+SSH_DIR = os.path.join(HOME, ".ssh")
+DESKTOP_HOSTS = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "Claude", "ssh_configs.json")
+
+KEY_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PUBKEY_RE = re.compile(r"^(ssh-|ecdsa-|sk-)\S+ [A-Za-z0-9+/=]+( [^\r\n]*)?$")
+KEY_TYPES = ("ed25519", "rsa", "ecdsa")
+TARGET_RE = re.compile(r"^[A-Za-z0-9._%\[\]:-]+(@[A-Za-z0-9._%\[\]:-]+)?$")
+TUNNEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+DEST_HOST = re.compile(r"^[A-Za-z0-9.\-:\[\]_]+$")
+DIRECTIONS = ("local", "remote")
+BINDS = ("127.0.0.1", "0.0.0.0")
+UNIT_PREFIX = "qs-launchpad-tunnel-"
+
+# Adds each stdin line to authorized_keys unless it's already there; prints ADD/SKIP per key.
+POSIX_INSTALL = (
+    "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; "
+    'while IFS= read -r k; do [ -n "$k" ] || continue; '
+    'grep -qxF "$k" ~/.ssh/authorized_keys && echo "SKIP $k" || '
+    '{ printf \'%s\\n\' "$k" >> ~/.ssh/authorized_keys; echo "ADD $k"; }; done; '
+    "chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys")
+
+# Lists *.pub in ~/.ssh as "name<TAB>has-private<TAB>first line"; never opens a private key.
+POSIX_LIST_KEYS = (
+    'for f in ~/.ssh/*.pub; do [ -f "$f" ] || continue; n=${f##*/}; p=0; [ -e "${f%.pub}" ] && p=1; '
+    'printf "%s\\t%s\\t" "$n" "$p"; head -n 1 "$f"; done')
+
+
+class Fail(Exception):
+    pass
+
+
+# ---- validation ----------------------------------------------------------------------
+
+def valid_target(target) -> str:
+    target = str(target or "").strip()
+    if not target or target.startswith("-") or not TARGET_RE.match(target):
+        raise Fail(f"Not an SSH host: {target!r}")
+    return target
+
+
+def valid_key_name(name) -> str:
+    if not isinstance(name, str) or not KEY_NAME.match(name) or name[0] in "-.":
+        raise Fail("Key names use letters, digits, '.', '_' and '-' (up to 64), and can't start with '-' or '.'.")
+    return name
+
+
+def clean_pubkey(text) -> str:
+    """One public key line. Private keys are refused outright."""
+    if not isinstance(text, str):
+        raise Fail("A public key must be text.")
+    if "-----BEGIN" in text or "PRIVATE KEY" in text:
+        raise Fail("That looks like a private key. Only public keys can be copied.")
+    line = text.strip()
+    if "\n" in line or "\r" in line or not PUBKEY_RE.match(line):
+        raise Fail("Not a public key line (expected e.g. 'ssh-ed25519 AAAA… comment').")
+    return line
+
+
+def port_number(value, what) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise Fail(f"The {what} must be a whole number from 1 to 65535.") from None
+    if isinstance(value, bool) or not 1 <= port <= 65535:
+        raise Fail(f"The {what} must be a whole number from 1 to 65535.")
+    return port
+
+
+# ---- hosts ---------------------------------------------------------------------------
+
+def config_aliases(path=os.path.join(SSH_DIR, "config"), seen=None) -> list:
+    """Host aliases in an ssh config (following Include), skipping patterns and negations."""
+    seen = set() if seen is None else seen
+    if path in seen:
+        return []
+    seen.add(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or parts[0].startswith("#"):
+            continue
+        key, rest = parts[0].lower(), parts[1].split("#", 1)[0]
+        if key == "include":
+            for pattern in shlex.split(rest):
+                pattern = os.path.expanduser(pattern)
+                if not os.path.isabs(pattern):
+                    pattern = os.path.join(SSH_DIR, pattern)
+                for inc in sorted(glob.glob(pattern)):
+                    out += [a for a in config_aliases(inc, seen) if a not in out]
+        elif key == "host":
+            for alias in shlex.split(rest):
+                if not any(c in alias for c in "*?!") and alias not in out:
+                    out.append(alias)
+    return out
+
+
+def resolve(target) -> dict:
+    """What ssh would actually connect to, from `ssh -G` (no network involved)."""
+    try:
+        res = subprocess.run(["ssh", "-G", "--", target], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {"hostname": target, "user": "", "port": 22}
+    opts = {}
+    for line in res.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        opts.setdefault(k, v)
+    return {"hostname": opts.get("hostname", target), "user": opts.get("user", ""), "port": int(opts.get("port", 22) or 22)}
+
+
+def reachable(hostname, port) -> bool:
+    try:
+        with socket.create_connection((hostname, port), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def cmd_hosts(args):
+    entries = [{"name": a, "target": a, "source": "config"} for a in config_aliases()]
+    try:
+        with open(DESKTOP_HOSTS) as f:
+            for c in json.load(f).get("configs", []):
+                if c.get("sshHost"):
+                    entries.append({"name": c.get("name") or c["sshHost"], "target": c["sshHost"], "source": "claude"})
+    except (OSError, ValueError):
+        pass
+    entries = [e for e in entries if TARGET_RE.match(e["target"]) and not e["target"].startswith("-")]
+
+    for e in entries:
+        e["reachable"] = None               # unknown until its probe answers
+    with ThreadPoolExecutor(max_workers=max(1, len(entries))) as pool:
+        for e, r in zip(entries, pool.map(lambda e: resolve(e["target"]), entries)):
+            e.update(r)
+
+    # Name lookups (mDNS .local names especially) ignore the connect timeout, so each probe runs in
+    # a daemon thread and anything still waiting at the deadline stays unknown instead of holding us up.
+    def probe(e):
+        e["reachable"] = reachable(e["hostname"], e["port"])
+    threads = [threading.Thread(target=probe, args=(e,), daemon=True) for e in entries]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + 2.5
+    for t in threads:
+        t.join(max(0, deadline - time.monotonic()))
+
+    hosts, seen = [], set()
+    for e in entries:                       # the same machine named twice keeps its first (config) entry
+        key = (e["user"], e["hostname"], e["port"])
+        if key not in seen:
+            seen.add(key)
+            hosts.append(e)
+    return {"hosts": hosts}
+
+
+# ---- running things on a host ------------------------------------------------------------
+
+def ssh_run(target, script, stdin="", timeout=60):
+    """Run a POSIX `script` on `target` with key login only (never prompts)."""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", valid_target(target), "sh -c " + shlex.quote(script)]
+    try:
+        res = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"Timed out talking to {target}.") from None
+    if res.returncode == 255:
+        raise Fail(f"SSH login to {target} failed: {res.stderr.strip().splitlines()[-1] if res.stderr.strip() else 'no key login'}")
+    return res
+
+
+def fingerprint(text) -> str:
+    res = subprocess.run(["ssh-keygen", "-lf", "-"], input=text + "\n", capture_output=True, text=True, timeout=15)
+    parts = res.stdout.split()
+    return parts[1] if res.returncode == 0 and len(parts) > 1 else ""
+
+
+def key_dict(name, path, text, has_private) -> dict:
+    parts = text.split(" ", 2)
+    return {"name": name, "path": path, "type": parts[0], "comment": parts[2] if len(parts) > 2 else "",
+            "fingerprint": fingerprint(text), "has_private": has_private, "text": text}
+
+
+def list_keys(host=None) -> list:
+    out = []
+    if not host:
+        for path in sorted(glob.glob(os.path.join(SSH_DIR, "*.pub"))):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read().strip()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if PUBKEY_RE.match(text):
+                stem = path[:-4]
+                out.append(key_dict(os.path.basename(stem), path, text, os.path.isfile(stem)))
+        return out
+    res = ssh_run(host, POSIX_LIST_KEYS)
+    for line in res.stdout.splitlines():
+        name, _, rest = line.partition("\t")
+        has_private, _, text = rest.partition("\t")
+        text = text.strip()
+        if name.endswith(".pub") and PUBKEY_RE.match(text):
+            out.append(key_dict(name[:-4], "~/.ssh/" + name, text, has_private == "1"))
+    return out
+
+
+def cmd_keys(args):
+    return {"host": args.get("host", ""), "keys": list_keys(args.get("host"))}
+
+
+def keygen_argv(args, passphrase_prompt):
+    name = valid_key_name(args.get("name"))
+    key_type = args.get("type") or "ed25519"
+    if key_type not in KEY_TYPES:
+        raise Fail("Key type must be ed25519, rsa or ecdsa.")
+    comment = args.get("comment", "")
+    if "\n" in comment or len(comment) > 200:
+        raise Fail("The comment must be one line of up to 200 characters.")
+    path = os.path.join(SSH_DIR, name) if not args.get("host") else "~/.ssh/" + name
+    argv = ["ssh-keygen", "-t", key_type] + (["-b", "4096"] if key_type == "rsa" else [])
+    argv += ["-f", path, "-C", comment] + ([] if passphrase_prompt else ["-q", "-N", ""])
+    return name, path, argv
+
+
+def cmd_generate(args):
+    name, path, argv = keygen_argv(args, passphrase_prompt=False)
+    host = args.get("host")
+    if not host:
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            raise Fail(f"~/.ssh/{name} already exists.")
+        os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            raise Fail(res.stderr.strip() or "ssh-keygen failed.")
+    else:
+        quoted = " ".join(shlex.quote(a) for a in argv).replace(shlex.quote(path), '"$HOME/.ssh/' + name + '"')
+        script = (f'umask 077; mkdir -p ~/.ssh; if [ -e ~/.ssh/{name} ] || [ -e ~/.ssh/{name}.pub ]; '
+                  f'then echo "EXISTS"; exit 3; fi; {quoted}')
+        res = ssh_run(host, script)
+        if "EXISTS" in res.stdout:
+            raise Fail(f"~/.ssh/{name} already exists on {host}.")
+        if res.returncode != 0:
+            raise Fail(res.stderr.strip() or "ssh-keygen failed.")
+    key = next((k for k in list_keys(host) if k["name"] == name), None)
+    return {"key": key}
+
+
+def cmd_keygen_command(args):
+    name, path, argv = keygen_argv(args, passphrase_prompt=True)
+    if not args.get("host"):
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            raise Fail(f"~/.ssh/{name} already exists.")
+        return {"argv": argv}
+    host = valid_target(args["host"])
+    remote = " ".join(shlex.quote(a) for a in argv).replace(shlex.quote(path), '"$HOME/.ssh/' + name + '"')
+    return {"argv": ["ssh", "-t", "--", host, "mkdir -p ~/.ssh && " + remote]}
+
+
+def stdin_keys() -> list:
+    keys = []
+    for line in sys.stdin.read().splitlines():
+        if line.strip():
+            k = clean_pubkey(line)
+            if k not in keys:
+                keys.append(k)
+    if not keys:
+        raise Fail("Choose at least one public key to copy.")
+    return keys
+
+
+def cmd_install(args):
+    host = valid_target(args.get("host"))
+    keys = stdin_keys()
+    res = ssh_run(host, POSIX_INSTALL, stdin="\n".join(keys) + "\n")
+    if res.returncode != 0:
+        raise Fail(f"Could not update authorized_keys on {host}: {res.stderr.strip() or res.returncode}")
+    added, skipped = [], []
+    for line in res.stdout.splitlines():
+        verb, _, rest = line.strip().partition(" ")
+        if verb in ("ADD", "SKIP"):
+            (added if verb == "ADD" else skipped).append(rest)
+    return {"added": added, "skipped": skipped}
+
+
+def cmd_install_command(args):
+    host = valid_target(args.get("host"))
+    keys = stdin_keys()
+    remote = ("umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; " + "; ".join(
+        f"grep -qxF {shlex.quote(k)} ~/.ssh/authorized_keys || printf '%s\\n' {shlex.quote(k)} "
+        ">> ~/.ssh/authorized_keys" for k in keys) +
+        "; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; echo 'Keys installed.'; sleep 2")
+    return {"argv": ["ssh", "-t", "--", host, remote]}
+
+
+# ---- tunnels -------------------------------------------------------------------------
+
+def free_id(name, used) -> str:
+    base = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-")[:28].strip("-") or "tunnel"
+    tid, n = base, 2
+    while tid in used:
+        tid, n = f"{base}-{n}", n + 1
+    return tid
+
+
+def validate_tunnel(spec) -> dict:
+    if not isinstance(spec, dict):
+        raise Fail("A tunnel must be an object.")
+    tid = str(spec.get("id") or "").strip()
+    if not TUNNEL_ID.match(tid):
+        raise Fail("A tunnel id is 1–32 lowercase letters, digits, - or _.")
+    name = str(spec.get("name") or "").strip()
+    if len(name) > 60 or any(c in name for c in "\r\n"):
+        raise Fail("The tunnel name must be a single line of up to 60 characters.")
+    target = valid_target(spec.get("target"))
+    port = spec.get("port")
+    ssh_port = port_number(port, "SSH port") if port not in (None, "") else None
+    direction, bind = spec.get("direction") or "local", spec.get("bind") or "127.0.0.1"
+    if direction not in DIRECTIONS:
+        raise Fail("Direction must be local or remote.")
+    if bind not in BINDS:
+        raise Fail("Bind address must be 127.0.0.1 or 0.0.0.0.")
+    dest = str(spec.get("dest_host") or "").strip()
+    if not dest or dest.startswith("-") or not DEST_HOST.match(dest):
+        raise Fail("The destination host may only contain letters, digits and . - : _ [ ].")
+    return {"id": tid, "name": name or f"{target} {direction}", "target": target, "port": ssh_port,
+            "direction": direction, "bind": bind, "listen_port": port_number(spec.get("listen_port"), "listen port"),
+            "dest_host": dest, "dest_port": port_number(spec.get("dest_port"), "destination port")}
+
+
+def tunnel_argv(spec) -> list:
+    flag = "-L" if spec["direction"] == "local" else "-R"
+    forward = f"{spec['bind']}:{spec['listen_port']}:{spec['dest_host']}:{spec['dest_port']}"
+    port_args = ["-p", str(spec["port"])] if spec.get("port") else []
+    return ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30", *port_args, flag, forward, "--", spec["target"]]
+
+
+def load_tunnels(path) -> list:
+    try:
+        with open(path) as f:
+            raw = json.load(f).get("tunnels", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    out, seen = [], set()
+    for t in raw if isinstance(raw, list) else []:
+        try:
+            spec = validate_tunnel(t)
+        except Fail:
+            continue
+        if spec["id"] not in seen:
+            seen.add(spec["id"])
+            out.append(spec)
+    return out
+
+
+def save_tunnels(path, tunnels):
+    with open(path + ".tmp", "w") as f:
+        json.dump({"tunnels": tunnels}, f, indent=4)
+        f.write("\n")
+    os.replace(path + ".tmp", path)
+
+
+def unit(tid) -> str:
+    return UNIT_PREFIX + tid + ".service"
+
+
+def systemctl(*args, check=False):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=20, check=check)
+
+
+def unit_states(ids) -> dict:
+    if not ids:
+        return {}
+    res = systemctl("show", "-p", "Id,ActiveState,Result,InvocationID", *[unit(i) for i in ids])
+    states, cur = {}, {}
+    for line in res.stdout.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("Id"):
+                states[cur["Id"][len(UNIT_PREFIX):-len(".service")]] = cur
+            cur = {}
+            continue
+        k, _, v = line.partition("=")
+        cur[k] = v
+    return states
+
+
+def last_error(tid, invocation="") -> str:
+    """The first thing ssh printed in the unit's latest run (e.g. "bind …: Address already in use")."""
+    match = ["_SYSTEMD_INVOCATION_ID=" + invocation] if invocation else ["_SYSTEMD_USER_UNIT=" + unit(tid)]
+    res = subprocess.run(["journalctl", "--user", *match, "-n", "20", "-o", "cat", "--no-pager"],
+                         capture_output=True, text=True, timeout=10)
+    lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+    return (lines[0] if lines else "The tunnel stopped.")[:300]
+
+
+def with_state(tunnels) -> list:
+    states = unit_states([t["id"] for t in tunnels])
+    out = []
+    for t in tunnels:
+        s = states.get(t["id"], {})
+        active = s.get("ActiveState", "inactive")
+        state = "running" if active == "active" else "starting" if active == "activating" else "failed" if active == "failed" else "stopped"
+        out.append({**t, "unit": unit(t["id"]), "state": state, "error": last_error(t["id"], s.get("InvocationID", "")) if state == "failed" else ""})
+    return out
+
+
+def cmd_tunnels(args):
+    return {"tunnels": with_state(load_tunnels(args["file"]))}
+
+
+def cmd_tunnel_save(args):
+    tunnels = load_tunnels(args["file"])
+    spec = json.loads(args["spec"])
+    if not isinstance(spec, dict):
+        raise Fail("A tunnel must be an object.")
+    if not str(spec.get("id") or "").strip():
+        spec["id"] = free_id(str(spec.get("name") or spec.get("target") or "tunnel"), {t["id"] for t in tunnels})
+    spec = validate_tunnel(spec)
+    replaced = [spec if t["id"] == spec["id"] else t for t in tunnels]
+    save_tunnels(args["file"], replaced if any(t["id"] == spec["id"] for t in tunnels) else tunnels + [spec])
+    return {"tunnel": spec}
+
+
+def cmd_tunnel_delete(args):
+    tid = args["id"]
+    systemctl("stop", unit(tid))
+    systemctl("reset-failed", unit(tid))
+    save_tunnels(args["file"], [t for t in load_tunnels(args["file"]) if t["id"] != tid])
+    return {"ok": True}
+
+
+def cmd_tunnel_start(args):
+    spec = next((t for t in load_tunnels(args["file"]) if t["id"] == args["id"]), None)
+    if spec is None:
+        raise Fail(f"No saved tunnel {args['id']!r}.")
+    if unit_states([spec["id"]]).get(spec["id"], {}).get("ActiveState") == "active":
+        return {"tunnel": with_state([spec])[0]}
+    systemctl("reset-failed", unit(spec["id"]))
+    res = subprocess.run(["systemd-run", "--user", "--quiet", "--unit=" + unit(spec["id"]),
+                          "--description=qs-launchpad tunnel: " + spec["name"], "--property=Restart=no", "--"]
+                         + tunnel_argv(spec), capture_output=True, text=True, timeout=20)
+    if res.returncode != 0:
+        raise Fail(res.stderr.strip() or "systemd-run failed.")
+    # ExitOnForwardFailure makes a bad forward fail within a moment; wait briefly to report it.
+    for _ in range(12):
+        time.sleep(0.25)
+        state = with_state([spec])[0]
+        if state["state"] == "failed":
+            raise Fail(state["error"] or "The tunnel stopped straight away.")
+    return {"tunnel": with_state([spec])[0]}
+
+
+def cmd_tunnel_stop(args):
+    systemctl("stop", unit(args["id"]))
+    systemctl("reset-failed", unit(args["id"]))
+    return {"ok": True}
+
+
+# ---- main ----------------------------------------------------------------------------
+
+def parse(argv):
+    """`cmd --flag value … positional…` → (cmd, {flag: value, positional names: …})."""
+    if not argv:
+        raise Fail("usage: ssh-tools COMMAND …")
+    cmd, rest, args, pos = argv[0], argv[1:], {}, []
+    i = 0
+    while i < len(rest):
+        if rest[i].startswith("--") and i + 1 < len(rest):
+            args[rest[i][2:]] = rest[i + 1]
+            i += 2
+        else:
+            pos.append(rest[i])
+            i += 1
+    names = {"tunnels": ["file"], "tunnel-save": ["file", "spec"], "tunnel-delete": ["file", "id"],
+             "tunnel-start": ["file", "id"], "tunnel-stop": ["id"]}.get(cmd, [])
+    if len(pos) < len(names):
+        raise Fail(f"usage: ssh-tools {cmd} {' '.join(n.upper() for n in names)}")
+    args.update(zip(names, pos))
+    return cmd, args
+
+
+COMMANDS = {"hosts": cmd_hosts, "keys": cmd_keys, "generate": cmd_generate, "keygen-command": cmd_keygen_command,
+            "install": cmd_install, "install-command": cmd_install_command, "tunnels": cmd_tunnels,
+            "tunnel-save": cmd_tunnel_save, "tunnel-delete": cmd_tunnel_delete,
+            "tunnel-start": cmd_tunnel_start, "tunnel-stop": cmd_tunnel_stop}
+
+
+def main():
+    try:
+        cmd, args = parse(sys.argv[1:])
+        if cmd not in COMMANDS:
+            raise Fail(f"Unknown command {cmd!r}.")
+        json.dump(COMMANDS[cmd](args), sys.stdout)
+        sys.stdout.flush()
+        os._exit(0)     # don't wait at exit for a probe thread still stuck in a name lookup
+    except (Fail, ValueError) as e:
+        json.dump({"error": str(e)}, sys.stdout)
+        sys.exit(1)
+    except (OSError, subprocess.SubprocessError) as e:
+        json.dump({"error": f"{type(e).__name__}: {e}"}, sys.stdout)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

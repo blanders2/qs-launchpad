@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Show a desktop notification with action buttons and print the action you pick.
+
+  notify [--app NAME] [--icon ICON] [--action KEY=Label]… SUMMARY [BODY]
+
+Talks to org.freedesktop.Notifications directly. notify-send can't do this here: AppArmor's
+notify-send profile blocks its GetCapabilities call, so it never shows buttons. Exits when the
+notification is clicked, closed or expires (after an hour at most).
+"""
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+NAME = "org.freedesktop.Notifications"
+PATH = "/org/freedesktop/Notifications"
+
+
+def main(argv):
+    app, icon, actions, rest = "", "", [], []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--app", "--icon", "--action") and i + 1 < len(argv):
+            if argv[i] == "--app":
+                app = argv[i + 1]
+            elif argv[i] == "--icon":
+                icon = argv[i + 1]
+            else:
+                key, _, label = argv[i + 1].partition("=")
+                actions += [key, label or key]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    if not rest:
+        print(__doc__, file=sys.stderr)
+        return 2
+    summary, body = rest[0], rest[1] if len(rest) > 1 else ""
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    loop = GLib.MainLoop()
+    state = {"id": None}
+
+    def on_signal(conn, sender, path, iface, signal, params):
+        args = params.unpack()
+        if args[0] != state["id"]:
+            return
+        if signal == "ActionInvoked":
+            print(args[1], flush=True)
+        loop.quit()
+
+    for signal in ("ActionInvoked", "NotificationClosed"):
+        bus.signal_subscribe(NAME, NAME, signal, PATH, None, Gio.DBusSignalFlags.NONE, on_signal)
+    reply = bus.call_sync(NAME, PATH, NAME, "Notify",
+                          GLib.Variant("(susssasa{sv}i)", (app, 0, icon, summary, body, actions, {}, -1)),
+                          GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, None)
+    state["id"] = reply.unpack()[0]
+    if not actions:
+        return 0
+    GLib.timeout_add_seconds(3600, loop.quit)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

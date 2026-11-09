@@ -1,0 +1,33 @@
+{
+    "terminal": ["terminalgoblin", "--cwd", "{cwd}", "--title", "{name}", "--color", "{color}"],
+    "claude": ["claude"],
+    "editor": ["code", "{cwd}"],
+    "fileManager": ["dolphin", "{cwd}"],
+    "remoteEditor": ["code", "--remote", "ssh-remote+{host}", "{cwd}"],
+    "remoteFileManager": ["dolphin", "sftp://{host}{cwd}"],
+
+    "projectRoots": ["~/Projects"],
+    "extraProjects": [],
+    "hideProjects": [],
+    "remotes": "auto",
+    "chromeProfile": "~/.config/google-chrome/Default",
+    "grokNotifications": true,
+    "showSdkSessions": false,
+    "showArchived": false,
+    "maxSessions": 200,
+
+    "screen": "",
+    "sliverPosition": 0.5,
+    "sliverLength": 120,
+    "panelWidth": 512,
+    "panelHeight": 720,
+    "hoverOpen": true,
+    "hoverDelay": 50,
+
+    "links": [
+        { "name": "New session", "icon": "+", "url": "claude://code/new", "note": "Claude Code in the desktop app" },
+        { "name": "claude.ai", "icon": "✻", "url": "https://claude.ai", "note": "Chat in the browser" },
+        { "name": "Claude Code docs", "icon": "❯", "url": "https://docs.claude.com/en/docs/claude-code/overview" },
+        { "name": "Claude settings", "icon": "⚙", "command": ["xdg-open", "~/.claude/settings.json"] }
+    ]
+}

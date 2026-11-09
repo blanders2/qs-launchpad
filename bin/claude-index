@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Index Claude Code projects and sessions for the launcher.
+
+  claude-index CONFIG              this machine's projects and sessions
+  claude-index --remotes CONFIG    the same for every SSH host, gathered over ssh
+  claude-index --config-json JSON  index this machine with an inline config (what remotes run)
+
+Prints one JSON object: {"projects": [...], "sessions": [...]} (plus "hosts" for --remotes).
+Per-file results are cached in ~/.cache/qs-launchpad/index.json keyed by mtime+size, so only
+new or changed session logs get re-read. Remote results are cached too, and shown (marked
+offline) when a host can't be reached.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import glob
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+CLAUDE = os.path.join(HOME, ".claude", "projects")
+DESKTOP = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "Claude")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "qs-launchpad")
+CACHE = os.path.join(CACHE_DIR, "index.json")
+CACHE_VERSION = 2
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(data, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def prompt_text(content):
+    """The typed text of a user message, or None for tool results / injected messages."""
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return None
+    text = " ".join(content.split())
+    if not text or text.startswith("<") or text.startswith("Caveat:"):
+        return None
+    return text
+
+
+def read_session(path):
+    info = {"cwd": None, "title": None, "aiTitle": None, "prompt": None, "turns": 0,
+            "entrypoint": None, "branch": None}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            # Cheap substring checks first: most lines are assistant output we never need.
+            if '"custom-title"' in line or '"ai-title"' in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "custom-title" and d.get("customTitle"):
+                    info["title"] = d["customTitle"]
+                elif d.get("type") == "ai-title" and d.get("aiTitle"):
+                    info["aiTitle"] = d["aiTitle"]
+                continue
+            if '"type":"user"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+                continue
+            if info["cwd"] is None:
+                info["cwd"] = d.get("cwd")
+                info["entrypoint"] = d.get("entrypoint")
+                info["branch"] = d.get("gitBranch")
+            text = prompt_text((d.get("message") or {}).get("content"))
+            if text:
+                info["turns"] += 1
+                if info["prompt"] is None:
+                    info["prompt"] = text[:400]
+    return info
+
+
+def index_here(cfg):
+    """Projects and sessions on this machine, in this machine's paths."""
+    cache = load_json(CACHE, {})
+    files = cache.get("files", {}) if cache.get("version") == CACHE_VERSION else {}
+    fresh = {}
+
+    sessions = []
+    for path in glob.glob(os.path.join(CLAUDE, "*", "*.jsonl")):
+        # ssh-<id>/ holds the desktop app's local copies of sessions that ran on an SSH host.
+        # Those are listed from the host itself (--remotes), with paths that make sense there.
+        if os.path.basename(os.path.dirname(path)).startswith("ssh-"):
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key = f"{st.st_mtime_ns}:{st.st_size}"
+        hit = files.get(path)
+        if hit and hit.get("key") == key:
+            info = hit["info"]
+        else:
+            try:
+                info = read_session(path)
+            except OSError:
+                continue
+        fresh[path] = {"key": key, "info": info}
+        if not info["cwd"] or not info["turns"]:
+            continue
+        if info["entrypoint"] == "sdk-cli" and not cfg.get("showSdkSessions", False):
+            continue
+        sid = os.path.basename(path)[:-len(".jsonl")]
+        title = info["title"]
+        # A rename from the desktop app lands in <session>/custom-title.json.
+        title = load_json(os.path.join(os.path.dirname(path), sid, "custom-title.json"), {}).get("customTitle") or title
+        sessions.append({
+            "id": sid,
+            "cwd": info["cwd"],
+            "title": title or info["aiTitle"] or info["prompt"][:90],
+            "prompt": info["prompt"],
+            "turns": info["turns"],
+            "branch": info["branch"] or "",
+            "source": info["entrypoint"] or "",
+            "time": int(st.st_mtime * 1000),
+            "exists": os.path.isdir(info["cwd"]),
+        })
+    save_json(CACHE, {"version": CACHE_VERSION, "files": fresh})
+
+    sessions.sort(key=lambda s: s["time"], reverse=True)
+
+    hidden = {os.path.expanduser(p).rstrip("/") for p in cfg.get("hideProjects", [])}
+    projects = {}
+
+    def add_project(path):
+        path = os.path.expanduser(path).rstrip("/") or "/"
+        if path in hidden or path in projects or not os.path.isdir(path):
+            return
+        name = "~" if path == HOME else os.path.basename(path)
+        short = "~" + path[len(HOME):] if path.startswith(HOME) else path
+        projects[path] = {"path": path, "name": name, "short": short, "sessions": 0, "time": 0, "last": ""}
+
+    for root in cfg.get("projectRoots", ["~/Projects"]):
+        root = os.path.expanduser(root)
+        try:
+            for entry in sorted(os.scandir(root), key=lambda e: e.name.lower()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    add_project(entry.path)
+        except OSError:
+            pass
+    for path in cfg.get("extraProjects", []):
+        add_project(path)
+    for s in sessions:
+        if s["exists"]:
+            add_project(s["cwd"])
+
+    return {"projects": list(projects.values()), "sessions": sessions}
+
+
+def desktop_meta():
+    """What the Claude desktop app knows: its titles, archived and superseded sessions, SSH hosts."""
+    titles, hidden, archived, ids = {}, set(), set(), {}
+    for path in glob.glob(os.path.join(DESKTOP, "claude-code-sessions", "**", "local_*.json"), recursive=True):
+        d = load_json(path, {})
+        sid = d.get("cliSessionId")
+        if not sid:
+            continue
+        if d.get("title"):
+            titles[sid] = d["title"]
+        if d.get("sessionId"):
+            ids[sid] = d["sessionId"]       # the app's own id (local_…), which its deep links take
+        if d.get("isArchived"):
+            archived.add(sid)
+        # When the app restarts a session it starts a new transcript and keeps the old id here.
+        for k in ("priorCliSessionIds", "priorRemoteCliSessionIds"):
+            hidden.update(d.get(k) or [])
+    hosts = [{"name": c.get("name") or c["sshHost"], "host": c["sshHost"]}
+             for c in load_json(os.path.join(DESKTOP, "ssh_configs.json"), {}).get("configs", []) if c.get("sshHost")]
+    return {"titles": titles, "hidden": hidden, "archived": archived, "ids": ids, "hosts": hosts}
+
+
+def pinned_ids(cfg_path):
+    """Session ids pinned in the launcher (pins.json beside the config), by host."""
+    pins = load_json(os.path.join(os.path.dirname(os.path.abspath(cfg_path)), "pins.json"), {}).get("pins", [])
+    out = set()
+    for k in pins:
+        if isinstance(k, str) and k.startswith("s:"):
+            host, _, sid = k[2:].rpartition(":")
+            out.add((host, sid))
+    return out
+
+
+def finish(data, cfg, meta, host="", host_name="", pinned=frozenset()):
+    """Apply desktop titles and hiding, tag with the host, link sessions to projects, and sort."""
+    sessions = []
+    for s in data["sessions"]:
+        if s["id"] in meta["hidden"] or (s["id"] in meta["archived"] and not cfg.get("showArchived", False)):
+            continue
+        s["title"] = meta["titles"].get(s["id"], s["title"])
+        s["desktopId"] = "" if s["id"] in meta["archived"] else meta["ids"].get(s["id"], "")
+        s["host"], s["hostName"] = host, host_name
+        sessions.append(s)
+    # Keep the newest maxSessions, plus anything pinned however old it is.
+    limit = int(cfg.get("maxSessions", 200))
+    sessions = [s for i, s in enumerate(sessions) if i < limit or (host, s["id"]) in pinned]
+    projects = {p["path"]: p for p in data["projects"]}
+    for p in projects.values():
+        p["host"], p["hostName"] = host, host_name
+        p["sessions"], p["time"], p["last"] = 0, 0, ""
+    for s in sessions:
+        p = projects.get(s["cwd"])
+        if p:
+            p["sessions"] += 1
+            if s["time"] > p["time"]:
+                p["time"], p["last"] = s["time"], s["title"]
+    ordered = sorted(projects.values(), key=lambda p: (-p["time"], p["name"].lower()))
+    return {"projects": ordered, "sessions": sessions}
+
+
+def remote_hosts(cfg, meta):
+    remotes = cfg.get("remotes", "auto")
+    if remotes == "auto":
+        return meta["hosts"]
+    return [r for r in remotes if isinstance(r, dict) and r.get("host")]
+
+
+def index_remote(r, cfg, meta, pinned):
+    name = r.get("name") or r["host"]
+    sub = {k: r.get(k, cfg.get(k)) for k in ("projectRoots", "extraProjects", "hideProjects", "showSdkSessions")}
+    sub = {k: v for k, v in sub.items() if v is not None}
+    cache = os.path.join(CACHE_DIR, "remote-" + "".join(c if c.isalnum() else "_" for c in r["host"]) + ".json")
+    status = {"name": name, "host": r["host"], "online": False, "error": ""}
+    try:
+        with open(os.path.abspath(__file__), "rb") as src:
+            out = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", r["host"],
+                 "python3 - --config-json " + shlex.quote(json.dumps(sub))],
+                stdin=src, capture_output=True, timeout=30)
+        if out.returncode != 0:
+            lines = out.stderr.decode(errors="replace").strip().splitlines()
+            raise RuntimeError(lines[-1] if lines else "ssh exited with %d" % out.returncode)
+        data = json.loads(out.stdout)
+        save_json(cache, data)
+        status["online"] = True
+    except Exception as e:  # unreachable, no python3, timeout…: fall back to the last good listing
+        status["error"] = str(e)[:200] or type(e).__name__
+        data = load_json(cache, {"projects": [], "sessions": []})
+    return status, finish(data, cfg, meta, r["host"], name, pinned)
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--config-json"]:
+        json.dump(index_here(json.loads(args[1])), sys.stdout)
+        return
+    remotes = args[:1] == ["--remotes"]
+    if remotes:
+        args = args[1:]
+    cfg = load_json(args[0], {}) if args else {}
+    pinned = pinned_ids(args[0]) if args else set()
+    meta = desktop_meta()
+
+    if not remotes:
+        json.dump(finish(index_here(cfg), cfg, meta, pinned=pinned), sys.stdout)
+        return
+
+    hosts = remote_hosts(cfg, meta)
+    out = {"hosts": [], "projects": [], "sessions": []}
+    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as pool:
+        for status, data in pool.map(lambda r: index_remote(r, cfg, meta, pinned), hosts):
+            out["hosts"].append(status)
+            out["projects"] += data["projects"]
+            out["sessions"] += data["sessions"]
+    json.dump(out, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

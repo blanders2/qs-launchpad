@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Print the Grok Bot app's bot list as JSON: {"bots": [...], "selected": id} (or {"error": ...}).
+
+Grok Bot caches the signed-in account's roster in ~/.config/Grok Bot/sand-client-persistence, one
+JSON file per key with the key base32-encoded in the file name. This reads only the active-account
+pointer and that account's roster; transcripts and drafts in the same folder are never opened.
+"""
+import base64
+import json
+import os
+import sys
+
+STORE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "Grok Bot", "sand-client-persistence")
+PREFIX = "sand.client.slice."
+
+
+def key_file(key):
+    return os.path.join(STORE, base64.b32encode(key.encode()).decode().rstrip("=").lower() + ".blob")
+
+
+def value(key):
+    with open(key_file(key)) as f:
+        return json.load(f)["value"]
+
+
+def main():
+    try:
+        slot = value(PREFIX + "client-meta.account-slot")       # e.g. "grok|user_…"
+    except (OSError, ValueError, KeyError):
+        return {"error": "Grok Bot isn't set up here (no signed-in account found)."}
+    account = PREFIX + "account." + slot.replace("|", "%7C") + "."
+    try:
+        rows = value(account + "roster.last-roster")["rows"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"error": "Grok Bot hasn't saved a bot list yet. Open Grok Bot once and it will."}
+    try:
+        selected = value(account + "selection.last-agent").get("agentId", "")
+    except (OSError, ValueError, KeyError, AttributeError):
+        selected = ""
+    bots = []
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("id") or r.get("isRemovedFromSidebar"):
+            continue
+        bots.append({
+            "id": r["id"],
+            "name": r.get("name") or r.get("title") or "Bot",
+            "description": " ".join(str(r.get("description") or "").split()),
+            "color": r.get("avatarColor") or "",
+            "unread": int(r.get("unreadCount") or 0),
+            "waiting": bool(r.get("awaitingUserResponse")),
+            "activity": int(r.get("lastActivityAt") or 0),
+            "hidden": bool(r.get("isHiddenFromSidebar")),
+            "group": bool(r.get("isGroup")),
+            "notify": bool(r.get("notificationsEnabled")),     # Grok Bot itself notifies for this bot
+            "preview": " ".join(str((r.get("lastEntry") or {}).get("text") or "").split())[:200],
+        })
+    bots.sort(key=lambda b: (b["hidden"], -b["activity"]))
+    return {"bots": bots, "selected": selected}
+
+
+if __name__ == "__main__":
+    json.dump(main(), sys.stdout)
